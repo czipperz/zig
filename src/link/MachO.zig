@@ -1982,8 +1982,8 @@ fn writeStubHelperCommon(self: *MachO) !void {
 fn resolveSymbolsInObject(
     self: *MachO,
     object_id: u16,
-    tentatives: *std.ArrayList(u32),
-    unresolved: *std.ArrayList(u32),
+    tentatives: *std.AutoArrayHashMap(u32, void),
+    unresolved: *std.AutoArrayHashMap(u32, void),
 ) !void {
     const object = &self.objects.items[object_id];
 
@@ -2064,14 +2064,9 @@ fn resolveSymbolsInObject(
                         return error.MultipleSymbolDefinitions;
                     }
                     if (symbolIsWeakDef(sym) or symbolIsPext(sym)) continue; // Current symbol is weak, so skip it.
+
                     if (symbolIsTentative(global.*)) {
-                        var i: usize = 0;
-                        while (i < tentatives.items.len) : (i += 1) {
-                            if (tentatives.items[i] == resolv.where_index) {
-                                _ = tentatives.swapRemove(i);
-                                break;
-                            }
-                        }
+                        _ = tentatives.fetchSwapRemove(resolv.where_index);
                     }
 
                     // Otherwise, update the resolver and the global symbol.
@@ -2090,14 +2085,7 @@ fn resolveSymbolsInObject(
                         .n_desc = 0,
                         .n_value = 0,
                     };
-
-                    var i: usize = 0;
-                    while (i < unresolved.items.len) : (i += 1) {
-                        if (unresolved.items[i] == resolv.where_index) {
-                            _ = unresolved.swapRemove(i);
-                            break;
-                        }
-                    }
+                    _ = unresolved.fetchSwapRemove(resolv.where_index);
                 },
             }
 
@@ -2131,7 +2119,7 @@ fn resolveSymbolsInObject(
                     .where_index = global_sym_index,
                     .file = object_id,
                 });
-                try tentatives.append(global_sym_index);
+                _ = try tentatives.getOrPut(global_sym_index);
                 continue;
             };
 
@@ -2155,7 +2143,7 @@ fn resolveSymbolsInObject(
                         .n_desc = sym.n_desc,
                         .n_value = sym.n_value,
                     });
-                    try tentatives.append(global_sym_index);
+                    _ = try tentatives.getOrPut(global_sym_index);
                     resolv.* = .{
                         .where = .global,
                         .where_index = global_sym_index,
@@ -2168,13 +2156,7 @@ fn resolveSymbolsInObject(
                         .n_desc = 0,
                         .n_value = 0,
                     };
-                    var i: usize = 0;
-                    while (i < unresolved.items.len) : (i += 1) {
-                        if (unresolved.items[i] == resolv.where_index) {
-                            _ = unresolved.swapRemove(i);
-                            break;
-                        }
-                    }
+                    _ = unresolved.fetchSwapRemove(resolv.where_index);
                 },
             }
         } else {
@@ -2194,16 +2176,16 @@ fn resolveSymbolsInObject(
                 .where_index = undef_sym_index,
                 .file = object_id,
             });
-            try unresolved.append(undef_sym_index);
+            _ = try unresolved.getOrPut(undef_sym_index);
         }
     }
 }
 
 fn resolveSymbols(self: *MachO) !void {
-    var tentatives = std.ArrayList(u32).init(self.base.allocator);
+    var tentatives = std.AutoArrayHashMap(u32, void).init(self.base.allocator);
     defer tentatives.deinit();
 
-    var unresolved = std.ArrayList(u32).init(self.base.allocator);
+    var unresolved = std.AutoArrayHashMap(u32, void).init(self.base.allocator);
     defer unresolved.deinit();
 
     // First pass, resolve symbols in provided objects.
@@ -2213,8 +2195,8 @@ fn resolveSymbols(self: *MachO) !void {
 
     // Second pass, resolve symbols in static libraries.
     var next_sym: usize = 0;
-    loop: while (next_sym < unresolved.items.len) {
-        const sym = self.undefs.items[unresolved.items[next_sym]];
+    loop: while (next_sym < unresolved.count()) {
+        const sym = self.undefs.items[unresolved.keys()[next_sym]];
         const sym_name = self.getString(sym.n_strx);
 
         for (self.archives.items) |archive| {
@@ -2242,7 +2224,10 @@ fn resolveSymbols(self: *MachO) !void {
 
     // Convert any tentative definition into a regular symbol and allocate
     // text blocks for each tentative defintion.
-    while (tentatives.popOrNull()) |index| {
+    var tentatives_count: usize = 0;
+    const ntentatives = tentatives.count();
+    while (tentatives_count < ntentatives) : (tentatives_count += 1) {
+        const index = tentatives.pop().key;
         const sym = &self.globals.items[index];
         const match: MatchingSection = blk: {
             if (self.common_section_index == null) {
@@ -2322,12 +2307,12 @@ fn resolveSymbols(self: *MachO) !void {
             .where = .undef,
             .where_index = undef_sym_index,
         });
-        try unresolved.append(undef_sym_index);
+        _ = try unresolved.getOrPut(undef_sym_index);
     }
 
     next_sym = 0;
-    loop: while (next_sym < unresolved.items.len) {
-        const sym = self.undefs.items[unresolved.items[next_sym]];
+    loop: while (next_sym < unresolved.count()) {
+        const sym = self.undefs.items[unresolved.keys()[next_sym]];
         const sym_name = self.getString(sym.n_strx);
 
         for (self.dylibs.items) |dylib, id| {
@@ -2344,7 +2329,7 @@ fn resolveSymbols(self: *MachO) !void {
             undef.n_type |= macho.N_EXT;
             undef.n_desc = @intCast(u16, ordinal + 1) * macho.N_SYMBOL_RESOLVER;
 
-            _ = unresolved.swapRemove(next_sym);
+            _ = unresolved.fetchSwapRemove(resolv.where_index);
 
             continue :loop;
         }
@@ -2378,13 +2363,7 @@ fn resolveSymbols(self: *MachO) !void {
         nlist.n_desc = macho.N_WEAK_DEF;
         try self.globals.append(self.base.allocator, nlist);
 
-        var i: usize = 0;
-        while (i < unresolved.items.len) : (i += 1) {
-            if (unresolved.items[i] == resolv.where_index) {
-                _ = unresolved.swapRemove(i);
-                break;
-            }
-        }
+        _ = unresolved.fetchSwapRemove(resolv.where_index);
 
         undef.* = .{
             .n_strx = 0,
@@ -2418,7 +2397,7 @@ fn resolveSymbols(self: *MachO) !void {
         }
     }
 
-    for (unresolved.items) |index| {
+    for (unresolved.keys()) |index| {
         const sym = self.undefs.items[index];
         const sym_name = self.getString(sym.n_strx);
         const resolv = self.symbol_resolver.get(sym.n_strx) orelse unreachable;
@@ -2427,7 +2406,7 @@ fn resolveSymbols(self: *MachO) !void {
         log.err("  first referenced in '{s}'", .{self.objects.items[resolv.file].name});
     }
 
-    if (unresolved.items.len > 0)
+    if (unresolved.count() > 0)
         return error.UndefinedSymbolReference;
 }
 
