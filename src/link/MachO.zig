@@ -132,9 +132,7 @@ objc_data_section_index: ?u16 = null,
 
 locals: std.ArrayListUnmanaged(macho.nlist_64) = .{},
 globals: std.ArrayListUnmanaged(macho.nlist_64) = .{},
-imports: std.ArrayListUnmanaged(macho.nlist_64) = .{},
 undefs: std.ArrayListUnmanaged(macho.nlist_64) = .{},
-tentatives: std.ArrayListUnmanaged(macho.nlist_64) = .{},
 symbol_resolver: std.AutoHashMapUnmanaged(u32, SymbolWithLoc) = .{},
 
 locals_free_list: std.ArrayListUnmanaged(u32) = .{},
@@ -250,9 +248,7 @@ const SymbolWithLoc = struct {
     // Table where the symbol can be found.
     where: enum {
         global,
-        import,
         undef,
-        tentative,
     },
     where_index: u32,
     local_sym_index: u32 = 0,
@@ -262,20 +258,9 @@ const SymbolWithLoc = struct {
 pub const GotIndirectionKey = struct {
     where: enum {
         local,
-        import,
+        undef,
     },
     where_index: u32,
-};
-
-pub const PIEFixup = struct {
-    /// Target VM address of this relocation.
-    target_addr: u64,
-
-    /// Offset within the byte stream.
-    offset: usize,
-
-    /// Size of the relocation.
-    size: usize,
 };
 
 /// When allocating, the ideal_capacity is calculated by
@@ -953,7 +938,7 @@ fn linkWithZld(self: *MachO, comp: *Compilation) !void {
             const resolv = self.symbol_resolver.get(n_strx) orelse unreachable;
             const got_index = @intCast(u32, self.got_entries.items.len);
             const got_entry = GotIndirectionKey{
-                .where = .import,
+                .where = .undef,
                 .where_index = resolv.where_index,
             };
             try self.got_entries.append(self.base.allocator, got_entry);
@@ -1879,7 +1864,7 @@ fn writeStubHelperCommon(self: *MachO) !void {
                     }) orelse unreachable;
                     const resolv = self.symbol_resolver.get(n_strx) orelse unreachable;
                     const got_index = self.got_entries_map.get(.{
-                        .where = .import,
+                        .where = .undef,
                         .where_index = resolv.where_index,
                     }) orelse unreachable;
                     const addr = got.addr + got_index * @sizeOf(u64);
@@ -1930,7 +1915,7 @@ fn writeStubHelperCommon(self: *MachO) !void {
                     }) orelse unreachable;
                     const resolv = self.symbol_resolver.get(n_strx) orelse unreachable;
                     const got_index = self.got_entries_map.get(.{
-                        .where = .import,
+                        .where = .undef,
                         .where_index = resolv.where_index,
                     }) orelse unreachable;
                     const this_addr = stub_helper.addr + 3 * @sizeOf(u32);
@@ -1994,7 +1979,12 @@ fn writeStubHelperCommon(self: *MachO) !void {
     }
 }
 
-fn resolveSymbolsInObject(self: *MachO, object_id: u16) !void {
+fn resolveSymbolsInObject(
+    self: *MachO,
+    object_id: u16,
+    tentatives: *std.ArrayList(u32),
+    unresolved: *std.ArrayList(u32),
+) !void {
     const object = &self.objects.items[object_id];
 
     log.debug("resolving symbols in '{s}'", .{object.name});
@@ -2062,7 +2052,6 @@ fn resolveSymbolsInObject(self: *MachO, object_id: u16) !void {
             };
 
             switch (resolv.where) {
-                .import => unreachable,
                 .global => {
                     const global = &self.globals.items[resolv.where_index];
 
@@ -2074,8 +2063,16 @@ fn resolveSymbolsInObject(self: *MachO, object_id: u16) !void {
                         log.err("  next definition in '{s}'", .{object.name});
                         return error.MultipleSymbolDefinitions;
                     }
-
                     if (symbolIsWeakDef(sym) or symbolIsPext(sym)) continue; // Current symbol is weak, so skip it.
+                    if (symbolIsTentative(global.*)) {
+                        var i: usize = 0;
+                        while (i < tentatives.items.len) : (i += 1) {
+                            if (tentatives.items[i] == resolv.where_index) {
+                                _ = tentatives.swapRemove(i);
+                                break;
+                            }
+                        }
+                    }
 
                     // Otherwise, update the resolver and the global symbol.
                     global.n_type = sym.n_type;
@@ -2093,16 +2090,14 @@ fn resolveSymbolsInObject(self: *MachO, object_id: u16) !void {
                         .n_desc = 0,
                         .n_value = 0,
                     };
-                },
-                .tentative => {
-                    const tentative = &self.tentatives.items[resolv.where_index];
-                    tentative.* = .{
-                        .n_strx = 0,
-                        .n_type = macho.N_UNDF,
-                        .n_sect = 0,
-                        .n_desc = 0,
-                        .n_value = 0,
-                    };
+
+                    var i: usize = 0;
+                    while (i < unresolved.items.len) : (i += 1) {
+                        if (unresolved.items[i] == resolv.where_index) {
+                            _ = unresolved.swapRemove(i);
+                            break;
+                        }
+                    }
                 },
             }
 
@@ -2123,8 +2118,8 @@ fn resolveSymbolsInObject(self: *MachO, object_id: u16) !void {
         } else if (symbolIsTentative(sym)) {
             // Symbol is a tentative definition.
             const resolv = self.symbol_resolver.getPtr(n_strx) orelse {
-                const tent_sym_index = @intCast(u32, self.tentatives.items.len);
-                try self.tentatives.append(self.base.allocator, .{
+                const global_sym_index = @intCast(u32, self.globals.items.len);
+                try self.globals.append(self.base.allocator, .{
                     .n_strx = try self.makeString(sym_name),
                     .n_type = sym.n_type,
                     .n_sect = 0,
@@ -2132,29 +2127,38 @@ fn resolveSymbolsInObject(self: *MachO, object_id: u16) !void {
                     .n_value = sym.n_value,
                 });
                 try self.symbol_resolver.putNoClobber(self.base.allocator, n_strx, .{
-                    .where = .tentative,
-                    .where_index = tent_sym_index,
+                    .where = .global,
+                    .where_index = global_sym_index,
                     .file = object_id,
                 });
+                try tentatives.append(global_sym_index);
                 continue;
             };
 
             switch (resolv.where) {
-                .import => unreachable,
-                .global => {},
+                .global => {
+                    const global = &self.globals.items[resolv.where_index];
+                    if (!symbolIsTentative(global.*)) continue;
+                    if (global.n_value >= sym.n_value) continue;
+
+                    global.n_desc = sym.n_desc;
+                    global.n_value = sym.n_value;
+                    resolv.file = object_id;
+                },
                 .undef => {
                     const undef = &self.undefs.items[resolv.where_index];
-                    const tent_sym_index = @intCast(u32, self.tentatives.items.len);
-                    try self.tentatives.append(self.base.allocator, .{
+                    const global_sym_index = @intCast(u32, self.globals.items.len);
+                    try self.globals.append(self.base.allocator, .{
                         .n_strx = undef.n_strx,
                         .n_type = sym.n_type,
                         .n_sect = 0,
                         .n_desc = sym.n_desc,
                         .n_value = sym.n_value,
                     });
+                    try tentatives.append(global_sym_index);
                     resolv.* = .{
-                        .where = .tentative,
-                        .where_index = tent_sym_index,
+                        .where = .global,
+                        .where_index = global_sym_index,
                         .file = object_id,
                     };
                     undef.* = .{
@@ -2164,14 +2168,13 @@ fn resolveSymbolsInObject(self: *MachO, object_id: u16) !void {
                         .n_desc = 0,
                         .n_value = 0,
                     };
-                },
-                .tentative => {
-                    const tentative = &self.tentatives.items[resolv.where_index];
-                    if (tentative.n_value >= sym.n_value) continue;
-
-                    tentative.n_desc = sym.n_desc;
-                    tentative.n_value = sym.n_value;
-                    resolv.file = object_id;
+                    var i: usize = 0;
+                    while (i < unresolved.items.len) : (i += 1) {
+                        if (unresolved.items[i] == resolv.where_index) {
+                            _ = unresolved.swapRemove(i);
+                            break;
+                        }
+                    }
                 },
             }
         } else {
@@ -2191,24 +2194,27 @@ fn resolveSymbolsInObject(self: *MachO, object_id: u16) !void {
                 .where_index = undef_sym_index,
                 .file = object_id,
             });
+            try unresolved.append(undef_sym_index);
         }
     }
 }
 
 fn resolveSymbols(self: *MachO) !void {
+    var tentatives = std.ArrayList(u32).init(self.base.allocator);
+    defer tentatives.deinit();
+
+    var unresolved = std.ArrayList(u32).init(self.base.allocator);
+    defer unresolved.deinit();
+
     // First pass, resolve symbols in provided objects.
     for (self.objects.items) |_, object_id| {
-        try self.resolveSymbolsInObject(@intCast(u16, object_id));
+        try self.resolveSymbolsInObject(@intCast(u16, object_id), &tentatives, &unresolved);
     }
 
     // Second pass, resolve symbols in static libraries.
     var next_sym: usize = 0;
-    loop: while (true) : (next_sym += 1) {
-        if (next_sym == self.undefs.items.len) break;
-
-        const sym = self.undefs.items[next_sym];
-        if (symbolIsNull(sym)) continue;
-
+    loop: while (next_sym < unresolved.items.len) {
+        const sym = self.undefs.items[unresolved.items[next_sym]];
         const sym_name = self.getString(sym.n_strx);
 
         for (self.archives.items) |archive| {
@@ -2226,17 +2232,18 @@ fn resolveSymbols(self: *MachO) !void {
                 self.base.options.target.cpu.arch,
                 offsets.items[0],
             );
-            try self.resolveSymbolsInObject(object_id);
+            try self.resolveSymbolsInObject(object_id, &tentatives, &unresolved);
 
             continue :loop;
         }
+
+        next_sym += 1;
     }
 
     // Convert any tentative definition into a regular symbol and allocate
     // text blocks for each tentative defintion.
-    for (self.tentatives.items) |sym| {
-        if (symbolIsNull(sym)) continue;
-
+    while (tentatives.popOrNull()) |index| {
+        const sym = &self.globals.items[index];
         const match: MatchingSection = blk: {
             if (self.common_section_index == null) {
                 const data_seg = &self.load_commands.items[self.data_segment_cmd_index.?].Segment;
@@ -2258,24 +2265,17 @@ fn resolveSymbols(self: *MachO) !void {
         mem.set(u8, code, 0);
         const alignment = (sym.n_desc >> 8) & 0x0f;
 
-        const resolv = self.symbol_resolver.getPtr(sym.n_strx) orelse unreachable;
+        sym.n_value = 0;
+        sym.n_desc = 0;
+        sym.n_sect = @intCast(u8, self.section_ordinals.getIndex(match).? + 1);
+        var local_sym = sym.*;
+        local_sym.n_type = macho.N_SECT;
+
         const local_sym_index = @intCast(u32, self.locals.items.len);
-        var nlist = macho.nlist_64{
-            .n_strx = sym.n_strx,
-            .n_type = macho.N_SECT,
-            .n_sect = @intCast(u8, self.section_ordinals.getIndex(match).? + 1),
-            .n_desc = 0,
-            .n_value = 0,
-        };
-        try self.locals.append(self.base.allocator, nlist);
-        const global_sym_index = @intCast(u32, self.globals.items.len);
-        nlist.n_type |= macho.N_EXT;
-        try self.globals.append(self.base.allocator, nlist);
-        resolv.* = .{
-            .where = .global,
-            .where_index = global_sym_index,
-            .local_sym_index = local_sym_index,
-        };
+        try self.locals.append(self.base.allocator, local_sym);
+
+        const resolv = self.symbol_resolver.getPtr(sym.n_strx) orelse unreachable;
+        resolv.local_sym_index = local_sym_index;
 
         const block = try self.base.allocator.create(TextBlock);
         block.* = TextBlock.empty;
@@ -2322,13 +2322,15 @@ fn resolveSymbols(self: *MachO) !void {
             .where = .undef,
             .where_index = undef_sym_index,
         });
+        try unresolved.append(undef_sym_index);
     }
 
-    loop: for (self.undefs.items) |sym| {
-        if (symbolIsNull(sym)) continue;
-
+    next_sym = 0;
+    loop: while (next_sym < unresolved.items.len) {
+        const sym = self.undefs.items[unresolved.items[next_sym]];
         const sym_name = self.getString(sym.n_strx);
-        for (self.dylibs.items) |*dylib, id| {
+
+        for (self.dylibs.items) |dylib, id| {
             if (!dylib.symbols.contains(sym_name)) continue;
 
             const dylib_id = @intCast(u16, id);
@@ -2339,28 +2341,15 @@ fn resolveSymbols(self: *MachO) !void {
             const ordinal = self.referenced_dylibs.getIndex(dylib_id) orelse unreachable;
             const resolv = self.symbol_resolver.getPtr(sym.n_strx) orelse unreachable;
             const undef = &self.undefs.items[resolv.where_index];
-            const import_sym_index = @intCast(u32, self.imports.items.len);
-            try self.imports.append(self.base.allocator, .{
-                .n_strx = undef.n_strx,
-                .n_type = macho.N_UNDF | macho.N_EXT,
-                .n_sect = 0,
-                .n_desc = @intCast(u16, ordinal + 1) * macho.N_SYMBOL_RESOLVER,
-                .n_value = 0,
-            });
-            resolv.* = .{
-                .where = .import,
-                .where_index = import_sym_index,
-            };
-            undef.* = .{
-                .n_strx = 0,
-                .n_type = macho.N_UNDF,
-                .n_sect = 0,
-                .n_desc = 0,
-                .n_value = 0,
-            };
+            undef.n_type |= macho.N_EXT;
+            undef.n_desc = @intCast(u16, ordinal + 1) * macho.N_SYMBOL_RESOLVER;
+
+            _ = unresolved.swapRemove(next_sym);
 
             continue :loop;
         }
+
+        next_sym += 1;
     }
 
     // Fourth pass, handle synthetic symbols and flag any undefined references.
@@ -2388,6 +2377,14 @@ fn resolveSymbols(self: *MachO) !void {
         nlist.n_type |= macho.N_EXT;
         nlist.n_desc = macho.N_WEAK_DEF;
         try self.globals.append(self.base.allocator, nlist);
+
+        var i: usize = 0;
+        while (i < unresolved.items.len) : (i += 1) {
+            if (unresolved.items[i] == resolv.where_index) {
+                _ = unresolved.swapRemove(i);
+                break;
+            }
+        }
 
         undef.* = .{
             .n_strx = 0,
@@ -2421,19 +2418,17 @@ fn resolveSymbols(self: *MachO) !void {
         }
     }
 
-    var has_undefined = false;
-    for (self.undefs.items) |sym| {
-        if (symbolIsNull(sym)) continue;
-
+    for (unresolved.items) |index| {
+        const sym = self.undefs.items[index];
         const sym_name = self.getString(sym.n_strx);
         const resolv = self.symbol_resolver.get(sym.n_strx) orelse unreachable;
 
         log.err("undefined reference to symbol '{s}'", .{sym_name});
         log.err("  first referenced in '{s}'", .{self.objects.items[resolv.file].name});
-        has_undefined = true;
     }
 
-    if (has_undefined) return error.UndefinedSymbolReference;
+    if (unresolved.items.len > 0)
+        return error.UndefinedSymbolReference;
 }
 
 fn parseTextBlocks(self: *MachO) !void {
@@ -2890,7 +2885,7 @@ fn writeGotEntries(self: *MachO) !void {
     for (self.got_entries.items) |key| {
         const address: u64 = switch (key.where) {
             .local => self.locals.items[key.where_index].n_value,
-            .import => 0,
+            .undef => 0,
         };
         try writer.writeIntLittle(u64, address);
     }
@@ -2959,7 +2954,7 @@ fn writeRebaseInfoTableZld(self: *MachO) !void {
         const segment_id = @intCast(u16, self.data_const_segment_cmd_index.?);
 
         for (self.got_entries.items) |entry, i| {
-            if (entry.where == .import) continue;
+            if (entry.where == .undef) continue;
 
             try pointers.append(.{
                 .offset = base_offset + i * @sizeOf(u64),
@@ -3016,7 +3011,7 @@ fn writeBindInfoTableZld(self: *MachO) !void {
         for (self.got_entries.items) |entry, i| {
             if (entry.where == .local) continue;
 
-            const sym = self.imports.items[entry.where_index];
+            const sym = self.undefs.items[entry.where_index];
             try pointers.append(.{
                 .offset = base_offset + i * @sizeOf(u64),
                 .segment_id = segment_id,
@@ -3041,7 +3036,7 @@ fn writeBindInfoTableZld(self: *MachO) !void {
                 const base_offset = sym.n_value - seg.inner.vmaddr;
 
                 for (block.bindings.items) |binding| {
-                    const bind_sym = self.imports.items[binding.local_sym_index];
+                    const bind_sym = self.undefs.items[binding.local_sym_index];
                     try pointers.append(.{
                         .offset = binding.offset + base_offset,
                         .segment_id = match.seg,
@@ -3088,7 +3083,7 @@ fn writeLazyBindInfoTableZld(self: *MachO) !void {
         try pointers.ensureUnusedCapacity(self.stubs.items.len);
 
         for (self.stubs.items) |import_id, i| {
-            const sym = self.imports.items[import_id];
+            const sym = self.undefs.items[import_id];
             pointers.appendAssumeCapacity(.{
                 .offset = base_offset + i * @sizeOf(u64),
                 .segment_id = segment_id,
@@ -3222,7 +3217,7 @@ fn writeSymbolTable(self: *MachO) !void {
 
     const nlocals = locals.items.len;
     const nexports = self.globals.items.len;
-    const nundefs = self.imports.items.len;
+    const nundefs = self.undefs.items.len;
 
     const locals_off = symtab.symoff + symtab.nsyms * @sizeOf(macho.nlist_64);
     const locals_size = nlocals * @sizeOf(macho.nlist_64);
@@ -3237,7 +3232,7 @@ fn writeSymbolTable(self: *MachO) !void {
     const undefs_off = exports_off + exports_size;
     const undefs_size = nundefs * @sizeOf(macho.nlist_64);
     log.debug("writing undefined symbols from 0x{x} to 0x{x}", .{ undefs_off, undefs_size + undefs_off });
-    try self.base.file.?.pwriteAll(mem.sliceAsBytes(self.imports.items), undefs_off);
+    try self.base.file.?.pwriteAll(mem.sliceAsBytes(self.undefs.items), undefs_off);
 
     symtab.nsyms += @intCast(u32, nlocals + nexports + nundefs);
     seg.inner.filesize += locals_size + exports_size + undefs_size;
@@ -3285,7 +3280,7 @@ fn writeSymbolTable(self: *MachO) !void {
     got.reserved1 = nstubs;
     for (self.got_entries.items) |entry| {
         switch (entry.where) {
-            .import => {
+            .undef => {
                 try writer.writeIntLittle(u32, dysymtab.iundefsym + entry.where_index);
             },
             .local => {
@@ -3321,8 +3316,6 @@ pub fn deinit(self: *MachO) void {
     self.strtab_dir.deinit(self.base.allocator);
     self.strtab.deinit(self.base.allocator);
     self.undefs.deinit(self.base.allocator);
-    self.tentatives.deinit(self.base.allocator);
-    self.imports.deinit(self.base.allocator);
     self.globals.deinit(self.base.allocator);
     self.globals_free_list.deinit(self.base.allocator);
     self.locals.deinit(self.base.allocator);
@@ -4388,9 +4381,9 @@ pub fn populateMissingMetadata(self: *MachO) !void {
     if (!self.strtab_dir.containsAdapted(@as([]const u8, "dyld_stub_binder"), StringSliceAdapter{
         .strtab = &self.strtab,
     })) {
-        const import_sym_index = @intCast(u32, self.imports.items.len);
+        const import_sym_index = @intCast(u32, self.undefs.items.len);
         const n_strx = try self.makeString("dyld_stub_binder");
-        try self.imports.append(self.base.allocator, .{
+        try self.undefs.append(self.base.allocator, .{
             .n_strx = n_strx,
             .n_type = macho.N_UNDF | macho.N_EXT,
             .n_sect = 0,
@@ -4398,11 +4391,11 @@ pub fn populateMissingMetadata(self: *MachO) !void {
             .n_value = 0,
         });
         try self.symbol_resolver.putNoClobber(self.base.allocator, n_strx, .{
-            .where = .import,
+            .where = .undef,
             .where_index = import_sym_index,
         });
         const got_key = GotIndirectionKey{
-            .where = .import,
+            .where = .undef,
             .where_index = import_sym_index,
         };
         const got_index = @intCast(u32, self.got_entries.items.len);
@@ -4534,9 +4527,9 @@ pub fn addExternFn(self: *MachO, name: []const u8) !u32 {
     }
 
     log.debug("adding new extern function '{s}' with dylib ordinal 1", .{sym_name});
-    const import_sym_index = @intCast(u32, self.imports.items.len);
+    const import_sym_index = @intCast(u32, self.undefs.items.len);
     const n_strx = try self.makeString(sym_name);
-    try self.imports.append(self.base.allocator, .{
+    try self.undefs.append(self.base.allocator, .{
         .n_strx = n_strx,
         .n_type = macho.N_UNDF | macho.N_EXT,
         .n_sect = 0,
@@ -4544,7 +4537,7 @@ pub fn addExternFn(self: *MachO, name: []const u8) !u32 {
         .n_value = 0,
     });
     try self.symbol_resolver.putNoClobber(self.base.allocator, n_strx, .{
-        .where = .import,
+        .where = .undef,
         .where_index = import_sym_index,
     });
 
@@ -4727,7 +4720,7 @@ fn writeGotEntry(self: *MachO, index: usize) !void {
     const got_entry = self.got_entries.items[index];
     const sym = switch (got_entry.where) {
         .local => self.locals.items[got_entry.where_index],
-        .import => self.imports.items[got_entry.where_index],
+        .undef => self.undefs.items[got_entry.where_index],
     };
     log.debug("writing offset table entry [ 0x{x} => 0x{x} ({s}) ]", .{
         off,
@@ -5011,7 +5004,7 @@ fn relocateSymbolTable(self: *MachO) !void {
     const symtab = &self.load_commands.items[self.symtab_cmd_index.?].Symtab;
     const nlocals = self.locals.items.len;
     const nglobals = self.globals.items.len;
-    const nundefs = self.imports.items.len;
+    const nundefs = self.undefs.items.len;
     const nsyms = nlocals + nglobals + nundefs;
 
     if (symtab.nsyms < nsyms) {
@@ -5056,7 +5049,7 @@ fn writeAllGlobalAndUndefSymbols(self: *MachO) !void {
     const symtab = &self.load_commands.items[self.symtab_cmd_index.?].Symtab;
     const nlocals = self.locals.items.len;
     const nglobals = self.globals.items.len;
-    const nundefs = self.imports.items.len;
+    const nundefs = self.undefs.items.len;
 
     const locals_off = symtab.symoff;
     const locals_size = nlocals * @sizeOf(macho.nlist_64);
@@ -5069,7 +5062,7 @@ fn writeAllGlobalAndUndefSymbols(self: *MachO) !void {
     const undefs_off = globals_off + globals_size;
     const undefs_size = nundefs * @sizeOf(macho.nlist_64);
     log.debug("writing extern symbols from 0x{x} to 0x{x}", .{ undefs_off, undefs_size + undefs_off });
-    try self.base.file.?.pwriteAll(mem.sliceAsBytes(self.imports.items), undefs_off);
+    try self.base.file.?.pwriteAll(mem.sliceAsBytes(self.undefs.items), undefs_off);
 
     // Update dynamic symbol table.
     const dysymtab = &self.load_commands.items[self.dysymtab_cmd_index.?].Dysymtab;
@@ -5124,7 +5117,7 @@ fn writeIndirectSymbolTable(self: *MachO) !void {
     got.reserved1 = nstubs;
     for (self.got_entries.items) |entry| {
         switch (entry.where) {
-            .import => {
+            .undef => {
                 try writer.writeIntLittle(u32, dysymtab.iundefsym + entry.where_index);
             },
             .local => {
@@ -5349,7 +5342,7 @@ fn writeRebaseInfoTable(self: *MachO) !void {
         const segment_id = @intCast(u16, self.data_const_segment_cmd_index.?);
 
         for (self.got_entries.items) |entry, i| {
-            if (entry.where == .import) continue;
+            if (entry.where == .undef) continue;
 
             try pointers.append(.{
                 .offset = base_offset + i * @sizeOf(u64),
@@ -5418,7 +5411,7 @@ fn writeBindInfoTable(self: *MachO) !void {
         for (self.got_entries.items) |entry, i| {
             if (entry.where == .local) continue;
 
-            const sym = self.imports.items[entry.where_index];
+            const sym = self.undefs.items[entry.where_index];
             try pointers.append(.{
                 .offset = base_offset + i * @sizeOf(u64),
                 .segment_id = segment_id,
@@ -5443,7 +5436,7 @@ fn writeBindInfoTable(self: *MachO) !void {
                 const base_offset = sym.n_value - seg.inner.vmaddr;
 
                 for (block.bindings.items) |binding| {
-                    const bind_sym = self.imports.items[binding.local_sym_index];
+                    const bind_sym = self.undefs.items[binding.local_sym_index];
                     try pointers.append(.{
                         .offset = binding.offset + base_offset,
                         .segment_id = match.seg,
@@ -5502,7 +5495,7 @@ fn writeLazyBindInfoTable(self: *MachO) !void {
         try pointers.ensureUnusedCapacity(self.stubs.items.len);
 
         for (self.stubs.items) |import_id, i| {
-            const sym = self.imports.items[import_id];
+            const sym = self.undefs.items[import_id];
             pointers.appendAssumeCapacity(.{
                 .offset = base_offset + i * @sizeOf(u64),
                 .segment_id = segment_id,
@@ -5836,10 +5829,6 @@ pub fn symbolIsWeakRef(sym: macho.nlist_64) bool {
 pub fn symbolIsTentative(sym: macho.nlist_64) bool {
     if (!symbolIsUndf(sym)) return false;
     return sym.n_value != 0;
-}
-
-pub fn symbolIsNull(sym: macho.nlist_64) bool {
-    return sym.n_value == 0 and sym.n_desc == 0 and sym.n_type == 0 and sym.n_strx == 0 and sym.n_sect == 0;
 }
 
 pub fn symbolIsTemp(sym: macho.nlist_64, sym_name: []const u8) bool {
